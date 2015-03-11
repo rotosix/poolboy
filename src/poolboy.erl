@@ -10,6 +10,12 @@
          code_change/3]).
 
 -define(TIMEOUT, 5000).
+%%-define(TIMEOUT, 1000).
+
+%% begin add by james.wu@asiainnovations.com on 2014-3-3 PM 7:45
+%% 线程池线程超过配额时，归还线程到线程池需要保持不释放的最长时间
+-define(INCR_KEEP_INTEVAL, 180).
+%% end add by james.wu@asiainnovations.com on 2014-3-3 PM 7:45
 
 -ifdef(pre17).
 -type pid_queue() :: queue().
@@ -27,6 +33,7 @@
 % Copied from gen:start_ret/0
 -type start_ret() :: {'ok', pid()} | 'ignore' | {'error', term()}.
 
+
 -record(state, {
     supervisor :: pid(),
     workers :: [pid()],
@@ -35,8 +42,20 @@
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
-    strategy = lifo :: lifo | fifo
+    %% begin modify by james.wu@asiainnovations.com on 2014-3-3 PM 7:45
+    %%strategy = lifo :: lifo | fifo,
+    strategy = lifo :: lifo | fifo,
+    last_incr_time = 0 %% 用来记录最后一次分配线程的时间，单位秒
+    %% end modify by james.wu@asiainnovations.com on 2014-3-3 PM 7:45
 }).
+
+%% begin add by james.wu@asiainnovations.com on 2014-3-3 PM 7:53
+%% 获取系统当前时间，精确到秒
+-spec get_time() -> integer().
+get_time() ->
+  {MegaSec, Sec, _MilliSec} = os:timestamp(),
+  MegaSec * 1000000 + Sec.
+%% begin add by james.wu@asiainnovations.com on 2014-3-3 PM 7:53
 
 -spec checkout(Pool :: pool()) -> pid().
 checkout(Pool) ->
@@ -50,9 +69,11 @@ checkout(Pool, Block) ->
     -> pid() | full.
 checkout(Pool, Block, Timeout) ->
     try
+      %%error_logger:info_msg("james-11 Pool ~p, Block ~p, Timeout ~p", [Pool, Block, Timeout]),
         gen_server:call(Pool, {checkout, Block}, Timeout)
     catch
         Class:Reason ->
+          %%error_logger:info_msg("james-12 self ~p, Pool ~p, Block ~p, Timeout ~p, Class ~p, Reason ~p, stack ~p", [self(), Pool, Block, Timeout, Class, Reason, erlang:get_stacktrace()]),
             gen_server:cast(Pool, {cancel_waiting, self()}),
             erlang:raise(Class, Reason, erlang:get_stacktrace())
     end.
@@ -169,18 +190,26 @@ handle_call({checkout, Block}, {FromPid, _} = From, State) ->
            monitors = Monitors,
            overflow = Overflow,
            max_overflow = MaxOverflow} = State,
+    %%error_logger:info_msg("james-21 self ~p, From ~p, overflow ~p, max_overflow ~p, process_count ~p, process_info ~p~n", [self(), From, Overflow, MaxOverflow, erlang:system_info(process_count), erlang:process_info(self())]),
     case Workers of
         [Pid | Left] ->
             Ref = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
+            %%error_logger:info_msg("james-22 self ~p, From ~p, overflow ~p, max_overflow ~p, Pid ~p, Ref ~p", [self(), From, Overflow, MaxOverflow, Pid, Ref]),
             {reply, Pid, State#state{workers = Left}};
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, Ref} = new_worker(Sup, FromPid),
             true = ets:insert(Monitors, {Pid, Ref}),
-            {reply, Pid, State#state{overflow = Overflow + 1}};
+            %%error_logger:info_msg("james-23 self ~p, From ~p, overflow ~p, max_overflow ~p, Pid ~p, Ref ~p", [self(), From, Overflow, MaxOverflow, Pid, Ref]),
+            %% begin modify by james.wu@asiainnovations.com on 2014-3-3 PM 7:59
+            %%{reply, Pid, State#state{overflow = Overflow + 1}};
+            {reply, Pid, State#state{overflow = Overflow + 1, last_incr_time = get_time()}};
+            %% begin modify by james.wu@asiainnovations.com on 2014-3-3 PM 7:59
         [] when Block =:= false ->
+            %%error_logger:info_msg("james-24 self ~p, From ~p, overflow ~p, max_overflow ~p", [self(), From, Overflow, MaxOverflow]),
             {reply, full, State};
         [] ->
+            %%error_logger:info_msg("james-25 self ~p, From ~p, overflow ~p, max_overflow ~p", [self(), From, Overflow, MaxOverflow]),
             Ref = erlang:monitor(process, FromPid),
             Waiting = queue:in({From, Ref}, State#state.waiting),
             {noreply, State#state{waiting = Waiting}}
@@ -286,14 +315,28 @@ handle_checkin(Pid, State) ->
            monitors = Monitors,
            overflow = Overflow,
            strategy = Strategy} = State,
-    case queue:out(Waiting) of
+
+  case queue:out(Waiting) of
         {{value, {From, Ref}}, Left} ->
             true = ets:insert(Monitors, {Pid, Ref}),
             gen_server:reply(From, Pid),
             State#state{waiting = Left};
         {empty, Empty} when Overflow > 0 ->
-            ok = dismiss_worker(Sup, Pid),
-            State#state{waiting = Empty, overflow = Overflow - 1};
+            %% begin modify by james.wu@asiainnovations.com on 2014-3-3 PM 7:59
+            %%ok = dismiss_worker(Sup, Pid),
+            %%State#state{waiting = Empty, overflow = Overflow - 1};
+            Diff = get_time() - State#state.last_incr_time,
+            if Diff > ?INCR_KEEP_INTEVAL ->
+              ok = dismiss_worker(Sup, Pid),
+              State#state{waiting = Empty, overflow = Overflow - 1};
+            true ->
+              Workers = case Strategy of
+                          lifo -> [Pid | State#state.workers];
+                          fifo -> State#state.workers ++ [Pid]
+                        end,
+              State#state{workers = Workers, waiting = Empty}
+            end;
+            %% end modify by james.wu@asiainnovations.com on 2014-3-3 PM 7:59
         {empty, Empty} ->
             Workers = case Strategy of
                 lifo -> [Pid | State#state.workers];
